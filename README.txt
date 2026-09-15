@@ -26,8 +26,40 @@ itemTpl：按照物品 ID 精确匹配。
 baseClass：按照物品的基础类别匹配。
 支持同时指定多个 baseClass。
 
+核心公式
+确定价格范围 [minP, maxP]
+对每个分类：
+
+若 rule.minPrice > 0 且 rule.maxPrice > rule.minPrice
+→ 使用手动指定值：minP = rule.minPrice，maxP = rule.maxPrice
+
+否则
+→ 自动扫描该分类内所有物品的原始价格，取最小值为 minP，最大值为 maxP
+
+
+计算折扣（对数插值）
+设物品原始价格为 P，分类价格范围为 [minP, maxP]，折扣范围为 [minD, maxD]：
+
+text
+若 maxP <= minP 或 maxD <= minD:
+    discount = minD
+否则若 P <= minP:
+    discount = minD
+否则若 P >= maxP:
+    discount = maxD
+否则:
+    t = ln(P / minP) / ln(maxP / minP)
+    discount = minD + t * (maxD - minD)
+
+计算新价格
+text
+newPrice = round(P * (1 - discount))
+若 newPrice < 1，则 newPrice = 1
+
+
 安装
 将 Mod 解压到 .\SPT_Runtime\user\mods 目录下。
+
 
 致谢
 
