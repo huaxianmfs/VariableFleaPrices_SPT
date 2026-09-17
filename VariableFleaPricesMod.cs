@@ -6,6 +6,7 @@ using SPTarkov.Server.Core.Extensions;
 using SPTarkov.Server.Core.Generators.Ragfair;
 using SPTarkov.Server.Core.Helpers.Items;
 using SPTarkov.Server.Core.Helpers.Server;
+using SPTarkov.Server.Core.Helpers.Traders;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Enums;
 using SPTarkov.Server.Core.Models.Spt.Config;
@@ -21,30 +22,33 @@ public class VariableFleaPricesMod(
     TemplateTable templateTable,
     ModHelper modHelper,
     ItemHelper itemHelper,
+    TraderHelper traderHelper,                 // ★ 新增：用于复刻 trader 价钳制
     RagfairConfig ragfairConfig,
     RagfairOfferHolder ragfairOfferHolder,
     RagfairOfferService ragfairOfferService,
     RagfairOfferGenerator ragfairOfferGenerator,
     ICloner cloner) : IOnLoad
 {
-    private Config config = new();
+    private Config clampedConfig = new();      // config.json         —— 受钳制
+    private Config unclampedConfig = new();    // config_freeprice.json —— 不受钳制
 
     private readonly string configFolderPath = Path.Join(
         modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly()),
         "config");
 
-    // 精确 tpl 匹配列表（优先级最高）
-    private readonly List<(MongoId Tpl, string Name, DiscountRule Rule)> parsedTplOverrides = new();
+    // 精确 tpl 匹配列表：最后一个 bool 表示"是否受钳制"
+    private readonly List<(MongoId Tpl, string Name, DiscountRule Rule, bool Clamp)> parsedTplOverrides = new();
 
     // baseClass 匹配列表
-    private readonly List<(MongoId BaseClass, string Name, DiscountRule Rule)> parsedBaseClassOverrides = new();
+    private readonly List<(MongoId BaseClass, string Name, DiscountRule Rule, bool Clamp)> parsedBaseClassOverrides = new();
 
-    // 缓存一份原始价格表（SPT 内置值），作为折扣计算的基准。
-    // 避免热重载 / 二次扫描时在已降价的价格上再乘一次。
     private Dictionary<MongoId, double> originalPrices = new();
 
+    private const string ClampedConfigFile = "config.json";
+    private const string UnclampedConfigFile = "config_freeprice.json";
+
     // =========================================================================
-    // 首次运行时如果 config.json 不存在，会自动生成一份带完整模板的默认配置
+    // config.json 首次不存在时的默认模板（受钳制的那份）
     // =========================================================================
     private const string DefaultConfigTemplate = """
 {
@@ -56,36 +60,6 @@ public class VariableFleaPricesMod(
     "maxDiscount": 0.40
   },
   "overrides": [
-    {
-      "name": "武器-G36系列",
-      "itemTpls": [],
-      "rule": {
-        "minPrice": 0,
-        "maxPrice": 0,
-        "minDiscount": 0.05,
-        "maxDiscount": 0.20
-      }
-    },
-    {
-      "name": "武器-AUG系列",
-      "itemTpls": [],
-      "rule": {
-        "minPrice": 0,
-        "maxPrice": 0,
-        "minDiscount": 0.05,
-        "maxDiscount": 0.20
-      }
-    },
-    {
-      "name": "武器-M1A系列",
-      "itemTpls": [],
-      "rule": {
-        "minPrice": 0,
-        "maxPrice": 0,
-        "minDiscount": 0.05,
-        "maxDiscount": 0.20
-      }
-    },
     {
       "name": "武器",
       "baseClasses": [
@@ -245,57 +219,73 @@ public class VariableFleaPricesMod(
 }
 """;
 
+    // =========================================================================
+    // config_freeprice.json 首次不存在时的默认模板（不受钳制的那份，默认空）
+    // =========================================================================
+    private const string DefaultUnclampedConfigTemplate = """
+{
+  "debug": false,
+  "defaultRule": {
+    "minPrice": 0,
+    "maxPrice": 0,
+    "minDiscount": 0.15,
+    "maxDiscount": 0.40
+  },
+  "overrides": []
+}
+""";
+
     public Task OnLoadAsync(CancellationToken cancellationToken)
     {
-        var configPath = Path.Join(configFolderPath, "config.json");
+        // ---------- 确保两份配置文件都存在 ----------
+        EnsureConfigExists(ClampedConfigFile, DefaultConfigTemplate);
+        EnsureConfigExists(UnclampedConfigFile, DefaultUnclampedConfigTemplate);
 
-        // 如果 config.json 不存在，自动生成一份带完整模板的默认配置
-        if (!File.Exists(configPath))
-        {
-            logger.Warning($"[VariableFleaPrices] 未找到 config.json，自动生成默认配置：{configPath}");
-            try
-            {
-                Directory.CreateDirectory(configFolderPath);
-                File.WriteAllText(configPath, DefaultConfigTemplate, new System.Text.UTF8Encoding(false));
-            }
-            catch (Exception ex)
-            {
-                logger.Error("[VariableFleaPrices] 生成默认 config.json 失败", ex);
-            }
-        }
+        // ---------- 加载两份配置 ----------
+        clampedConfig = LoadConfig(ClampedConfigFile) ?? new Config();
+        unclampedConfig = LoadConfig(UnclampedConfigFile) ?? new Config();
 
-        try
-        {
-            config = modHelper.GetJsonDataFromFile<Config>(configFolderPath, "config.json");
-        }
-        catch (Exception ex)
-        {
-            logger.Error("[VariableFleaPrices] 读取 config.json 失败，使用内置默认", ex);
-            config = new Config();
-        }
+        clampedConfig.defaultRule ??= new DiscountRule();
+        clampedConfig.overrides ??= new List<CategoryOverride>();
+        unclampedConfig.defaultRule ??= new DiscountRule();
+        unclampedConfig.overrides ??= new List<CategoryOverride>();
 
-        config.defaultRule ??= new DiscountRule();
-        config.overrides ??= new List<CategoryOverride>();
-
-        logger.Info($"[VariableFleaPrices] config 加载完成：defaultRule(minP={config.defaultRule.minPrice}, maxP={config.defaultRule.maxPrice}, minD={config.defaultRule.minDiscount}, maxD={config.defaultRule.maxDiscount}), overrides 数量={config.overrides.Count}");
+        logger.Info($"[VariableFleaPrices] 已加载 config.json：overrides={clampedConfig.overrides.Count}（受钳制）");
+        logger.Info($"[VariableFleaPrices] 已加载 config_freeprice.json：overrides={unclampedConfig.overrides.Count}（不受钳制）");
 
         // =========================================================================
-        // 关键修复 1：关闭 SPT 内置跳蚤基础价生成
+        // 全局禁用 SPT 原生钳制
         // =========================================================================
-        var baseGen = ragfairConfig.Dynamic.GenerateBaseFleaPrices;
-
-        logger.Info($"[VariableFleaPrices] 修改前 GenerateBaseFleaPrices: UseHandbookPrice={baseGen.UseHandbookPrice}, PriceMultiplier={baseGen.PriceMultiplier}, PreventPriceBeingBelowTraderBuyPrice={baseGen.PreventPriceBeingBelowTraderBuyPrice}, UseHideoutCraftMultiplier={baseGen.UseHideoutCraftMultiplier}");
+        var dyn = ragfairConfig.Dynamic;
+        var baseGen = dyn.GenerateBaseFleaPrices;
 
         baseGen.UseHandbookPrice = false;
         baseGen.PriceMultiplier = 1.0;
         baseGen.PreventPriceBeingBelowTraderBuyPrice = false;
         baseGen.UseHideoutCraftMultiplier = false;
 
-        logger.Info("[VariableFleaPrices] 已禁用 SPT 内置跳蚤价计算，PriceMultiplier 归一到 1.0");
+        dyn.OfferAdjustment.AdjustPriceWhenBelowHandbookPrice = false;
+        dyn.UseTraderPriceForOffersIfHigher = false;
 
-        // =========================================================================
-        // 关键修复 2：缓存原始价格表作为折扣基准
-        // =========================================================================
+        if (dyn.UnreasonableModPrices != null && dyn.UnreasonableModPrices.Count > 0)
+        {
+            logger.Info($"[VariableFleaPrices] 清空 UnreasonableModPrices，共 {dyn.UnreasonableModPrices.Count} 条规则");
+            dyn.UnreasonableModPrices.Clear();
+        }
+        if (dyn.ItemPriceMultiplier != null && dyn.ItemPriceMultiplier.Count > 0)
+        {
+            logger.Info($"[VariableFleaPrices] 清空 ItemPriceMultiplier，共 {dyn.ItemPriceMultiplier.Count} 条");
+            dyn.ItemPriceMultiplier.Clear();
+        }
+        if (dyn.ItemPriceOverrideRouble != null && dyn.ItemPriceOverrideRouble.Count > 0)
+        {
+            logger.Info($"[VariableFleaPrices] 清空 ItemPriceOverrideRouble，共 {dyn.ItemPriceOverrideRouble.Count} 条");
+            dyn.ItemPriceOverrideRouble.Clear();
+        }
+
+        logger.Info("[VariableFleaPrices] 已禁用 SPT 原生钳制，按配置文件分别处理");
+
+        // ---------- 缓存原始价格表 ----------
         if (originalPrices.Count == 0)
         {
             var cloned = cloner.Clone(templateTable.Prices);
@@ -303,11 +293,46 @@ public class VariableFleaPricesMod(
             logger.Info($"[VariableFleaPrices] 已缓存原始价格表，共 {originalPrices.Count} 项");
         }
 
+        // ---------- 解析两份配置的覆盖项 ----------
         ParseOverrides();
+
+        // ---------- 应用折扣 ----------
         ApplyLocalDiscount();
+
+        // ---------- 刷新报价 ----------
         RefreshRagfair();
 
         return Task.CompletedTask;
+    }
+
+    private void EnsureConfigExists(string fileName, string defaultTemplate)
+    {
+        var path = Path.Join(configFolderPath, fileName);
+        if (File.Exists(path)) return;
+
+        logger.Warning($"[VariableFleaPrices] 未找到 {fileName}，自动生成默认配置：{path}");
+        try
+        {
+            Directory.CreateDirectory(configFolderPath);
+            File.WriteAllText(path, defaultTemplate, new System.Text.UTF8Encoding(false));
+        }
+        catch (Exception ex)
+        {
+            logger.Error($"[VariableFleaPrices] 生成 {fileName} 失败", ex);
+        }
+    }
+
+    private Config? LoadConfig(string fileName)
+    {
+        try
+        {
+            return modHelper.GetJsonDataFromFile<Config>(configFolderPath, fileName);
+        }
+        catch (Exception ex)
+        {
+            logger.Error($"[VariableFleaPrices] 读取 {fileName} 失败", ex);
+            return null;
+        }
     }
 
     private void ParseOverrides()
@@ -315,23 +340,29 @@ public class VariableFleaPricesMod(
         parsedTplOverrides.Clear();
         parsedBaseClassOverrides.Clear();
 
-        if (config.overrides.Count == 0)
+        // ★ 关键：先解析"不受钳制"的，再解析"受钳制"的。
+        // 因为 ResolveRuleWithName 从头到尾遍历，先插入的优先。
+        // 这样一份物品同时出现在两份配置时，不受钳制的版本会覆盖受钳制的版本。
+        ParseOverridesFromConfig(unclampedConfig, isClamped: false, sourceName: UnclampedConfigFile);
+        ParseOverridesFromConfig(clampedConfig, isClamped: true, sourceName: ClampedConfigFile);
+    }
+
+    private void ParseOverridesFromConfig(Config cfg, bool isClamped, string sourceName)
+    {
+        if (cfg.overrides.Count == 0)
         {
-            logger.Info("[VariableFleaPrices] 没有配置分类覆盖，全部使用默认规则");
+            logger.Info($"[VariableFleaPrices] {sourceName} 没有配置分类覆盖");
             return;
         }
 
-        foreach (var ov in config.overrides)
+        foreach (var ov in cfg.overrides)
         {
             if (ov == null) continue;
 
             var displayName = string.IsNullOrWhiteSpace(ov.name) ? "(未命名)" : ov.name;
-            var rule = ov.rule ?? config.defaultRule;
+            var rule = ov.rule ?? cfg.defaultRule;
 
-            bool hasTpl = false;
-            bool hasBaseClass = false;
-
-            // --- 1) 精确 tpl 匹配（优先级最高） ---
+            // --- 1) 精确 tpl 匹配 ---
             if (ov.itemTpls != null && ov.itemTpls.Count > 0)
             {
                 foreach (var tplStr in ov.itemTpls)
@@ -341,20 +372,18 @@ public class VariableFleaPricesMod(
                     try
                     {
                         var tplId = new MongoId(tplStr);
-                        parsedTplOverrides.Add((tplId, displayName, rule));
-                        logger.Info($"[VariableFleaPrices] 注册 tpl 覆盖：{displayName} ({tplId})");
-                        hasTpl = true;
+                        parsedTplOverrides.Add((tplId, displayName, rule, isClamped));
+                        logger.Info($"[VariableFleaPrices] [{sourceName}] 注册 tpl 覆盖：{displayName} ({tplId}) 受钳制={isClamped}");
                     }
                     catch
                     {
-                        logger.Warning($"[VariableFleaPrices] 无法解析 itemTpl：'{tplStr}'（分类 {displayName}），已跳过");
+                        logger.Warning($"[VariableFleaPrices] [{sourceName}] 无法解析 itemTpl：'{tplStr}'（分类 {displayName}）");
                     }
                 }
             }
 
             // --- 2) baseClass 匹配 ---
             var classStrings = new List<string>();
-
             if (ov.baseClasses != null)
             {
                 foreach (var s in ov.baseClasses)
@@ -362,7 +391,6 @@ public class VariableFleaPricesMod(
                     if (!string.IsNullOrWhiteSpace(s)) classStrings.Add(s);
                 }
             }
-
             if (!string.IsNullOrWhiteSpace(ov.baseClass))
             {
                 classStrings.Add(ov.baseClass!);
@@ -373,53 +401,12 @@ public class VariableFleaPricesMod(
                 var id = ResolveBaseClass(classStr);
                 if (id == null)
                 {
-                    logger.Warning($"[VariableFleaPrices] 无法解析 baseClass：'{classStr}'（分类 {displayName}），已跳过");
+                    logger.Warning($"[VariableFleaPrices] [{sourceName}] 无法解析 baseClass：'{classStr}'（分类 {displayName}）");
                     continue;
                 }
 
-                parsedBaseClassOverrides.Add((id.Value, displayName, rule));
-                logger.Info($"[VariableFleaPrices] 注册 baseClass 覆盖：{displayName} ({id.Value})");
-                hasBaseClass = true;
-            }
-
-            if (!hasTpl && !hasBaseClass && config.debug)
-            {
-                logger.Debug($"[VariableFleaPrices] 分类 {displayName} 既没有 itemTpls 也没有 baseClasses，已跳过");
-            }
-        }
-
-        // === 诊断：baseClass 每条匹配到多少物品 ===
-        if (parsedBaseClassOverrides.Count > 0)
-        {
-            var priceKeys = templateTable.Prices.Keys.ToList();
-
-            foreach (var (baseClass, name, _) in parsedBaseClassOverrides)
-            {
-                int matchCount = 0;
-                int errorCount = 0;
-                string firstError = "";
-
-                foreach (var itemId in priceKeys)
-                {
-                    try
-                    {
-                        if (itemHelper.IsOfBaseclass(itemId, baseClass))
-                        {
-                            matchCount++;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        errorCount++;
-                        if (errorCount == 1) firstError = ex.Message;
-                    }
-                }
-
-                logger.Info($"[VariableFleaPrices] 诊断：分类 {name} ({baseClass}) 匹配 {matchCount}/{priceKeys.Count} 个物品（异常 {errorCount} 个）");
-                if (errorCount > 0)
-                {
-                    logger.Warning($"[VariableFleaPrices] 诊断：{name} 首个异常：{firstError}");
-                }
+                parsedBaseClassOverrides.Add((id.Value, displayName, rule, isClamped));
+                logger.Info($"[VariableFleaPrices] [{sourceName}] 注册 baseClass 覆盖：{displayName} ({id.Value}) 受钳制={isClamped}");
             }
         }
     }
@@ -439,10 +426,7 @@ public class VariableFleaPricesMod(
                 if (val is string s && !string.IsNullOrWhiteSpace(s)) return new MongoId(s);
             }
         }
-        catch
-        {
-            // 忽略，继续当 MongoId 处理
-        }
+        catch { }
 
         try
         {
@@ -458,56 +442,42 @@ public class VariableFleaPricesMod(
     {
         var prices = templateTable.Prices;
 
-        // =========================================================================
-        // 第一趟：确定每个物品属于哪个分类，并统计每个分类的【实际价格范围】
-        // =========================================================================
-        var itemRuleName = new Dictionary<MongoId, string>();     // itemId -> 分类名
-        var itemRule = new Dictionary<MongoId, DiscountRule>();   // itemId -> 规则
+        // 第一趟：确定每个物品属于哪个分类 + 是否受钳制 + 统计分类价格范围
+        var itemRuleName = new Dictionary<MongoId, string>();
+        var itemRule = new Dictionary<MongoId, DiscountRule>();
+        var itemClamp = new Dictionary<MongoId, bool>();
         var categoryRange = new Dictionary<string, (double Min, double Max)>();
 
         foreach (var itemId in prices.Keys.ToList())
         {
             double basePrice;
             if (originalPrices.TryGetValue(itemId, out var orig) && orig > 0)
-            {
                 basePrice = orig;
-            }
             else
-            {
                 basePrice = prices[itemId];
-            }
 
             if (basePrice <= 0) continue;
 
-            var (rule, ruleName) = ResolveRuleWithName(itemId);
+            var (rule, ruleName, clamp) = ResolveRuleWithName(itemId);
             itemRuleName[itemId] = ruleName;
             itemRule[itemId] = rule;
+            itemClamp[itemId] = clamp;
 
             if (categoryRange.TryGetValue(ruleName, out var range))
-            {
                 categoryRange[ruleName] = (Math.Min(range.Min, basePrice), Math.Max(range.Max, basePrice));
-            }
             else
-            {
                 categoryRange[ruleName] = (basePrice, basePrice);
-            }
         }
 
-        // 日志：每个分类的实际价格范围（这是自动归一化用的端点）
         foreach (var kv in categoryRange)
         {
             logger.Info($"[VariableFleaPrices] 分类 {kv.Key} 自动价格范围: {kv.Value.Min:F0} ~ {kv.Value.Max:F0}");
         }
 
-        // =========================================================================
-        // 第二趟：对每个物品，用【它所在分类的 min/max】做对数插值算折扣
-        // =========================================================================
-        int affected = 0, failed = 0;
+        // 第二趟：应用折扣 + 视情况钳制
+        int affected = 0, failed = 0, clampedCount = 0;
         var ruleHitCount = new Dictionary<string, int>();
-        foreach (var name in categoryRange.Keys)
-        {
-            ruleHitCount[name] = 0;
-        }
+        foreach (var name in categoryRange.Keys) ruleHitCount[name] = 0;
         ruleHitCount["[default]"] = 0;
 
         foreach (var itemId in prices.Keys.ToList())
@@ -518,22 +488,16 @@ public class VariableFleaPricesMod(
 
                 var rule = itemRule[itemId];
                 var range = categoryRange[ruleName];
+                var clamp = itemClamp.GetValueOrDefault(itemId, true);
 
                 double basePrice;
                 if (originalPrices.TryGetValue(itemId, out var orig) && orig > 0)
-                {
                     basePrice = orig;
-                }
                 else
-                {
                     basePrice = prices[itemId];
-                }
 
                 if (basePrice <= 0) continue;
 
-                // ★ 归一化端点：
-                //   - rule.minPrice / rule.maxPrice 都 > 0 且有效时，用手动值（硬性覆盖）
-                //   - 否则用该分类自动扫出来的实际范围
                 double minP, maxP;
                 if (rule.minPrice > 0 && rule.maxPrice > rule.minPrice)
                 {
@@ -550,9 +514,17 @@ public class VariableFleaPricesMod(
                 var newPrice = Math.Round(basePrice * (1.0 - discount));
                 if (newPrice < 1) newPrice = 1;
 
-                if (config.debug)
+                // ★ 按配置决定是否钳制
+                if (clamp)
                 {
-                    logger.Debug($"[VariableFleaPrices] {itemId}: {basePrice:F0} -> {newPrice:F0} (降 {discount * 100:F1}%) [{ruleName}] 端点({minP:F0}~{maxP:F0})");
+                    var before = newPrice;
+                    newPrice = ApplyClampingForItem(itemId, newPrice);
+                    if (Math.Abs(newPrice - before) > 0.01) clampedCount++;
+                }
+
+                if (config_debug())
+                {
+                    logger.Debug($"[VariableFleaPrices] {itemId}: {basePrice:F0} -> {newPrice:F0} (降 {discount * 100:F1}%) [{ruleName}] 受钳制={clamp}");
                 }
 
                 prices[itemId] = newPrice;
@@ -562,66 +534,80 @@ public class VariableFleaPricesMod(
             catch (Exception ex)
             {
                 failed++;
-                if (config.debug)
-                {
-                    logger.Debug($"[VariableFleaPrices] 处理 {itemId} 失败：{ex.Message}");
-                }
+                if (config_debug()) logger.Debug($"[VariableFleaPrices] 处理 {itemId} 失败：{ex.Message}");
             }
         }
 
-        logger.Info($"[VariableFleaPrices] 已对 {affected} 个物品应用折扣（失败 {failed} 个）");
+        logger.Info($"[VariableFleaPrices] 已对 {affected} 个物品应用折扣（失败 {failed} 个，其中 {clampedCount} 个被钳制）");
 
         foreach (var kv in ruleHitCount)
         {
             logger.Info($"[VariableFleaPrices] 规则命中统计：{kv.Key} -> {kv.Value} 个物品");
         }
-
-        if (config.debug && prices.Count > 0)
-        {
-            var sorted = prices.OrderBy(kv => kv.Value).ToList();
-            var positions = new[] { 0, sorted.Count / 2, sorted.Count - 1 };
-            foreach (var pos in positions)
-            {
-                var kv = sorted[pos];
-                logger.Info($"[VariableFleaPrices] 样本(序{pos}): {kv.Key} = {kv.Value:F0}");
-            }
-        }
     }
 
     /// <summary>
-    /// 决定一件物品走哪条规则。
-    /// 匹配顺序：先精确 tpl（武器细分），再 baseClass（大类），都没有就走 defaultRule。
+    /// 复刻 SPT 原生钳制逻辑：
+    ///   1) 低于 handbook × 阈值时，抬到 handbook × 1.1
+    ///   2) Trader 收购价更高时，抬到 Trader 价
     /// </summary>
-    private (DiscountRule Rule, string Name) ResolveRuleWithName(MongoId itemId)
+    private double ApplyClampingForItem(MongoId tpl, double price)
     {
-        // 1) 精确 tpl 匹配
-        foreach (var (tpl, name, rule) in parsedTplOverrides)
+        double result = price;
+
+        // --- 1) handbook 钳制 ---
+        double hbPrice = 0;
+        try
         {
-            if (tpl == itemId) return (rule, name);
+            var hbItem = templateTable.Handbook.Items.FirstOrDefault(x => x.Id == tpl);
+            if (hbItem != null) hbPrice = hbItem.Price ?? 0;
+        }
+        catch { }
+
+        if (hbPrice > 0 && result > 0)
+        {
+            // 复刻 RagfairPriceService.AdjustPriceIfBelowHandbook
+            double priceDifference = 100.0 * hbPrice / (hbPrice + result);
+            var oa = ragfairConfig.Dynamic.OfferAdjustment;
+            if (priceDifference > oa.MaxPriceDifferenceBelowHandbookPercent && result >= oa.PriceThresholdRub)
+            {
+                result = Math.Round(hbPrice * oa.HandbookPriceMultiplier);
+            }
+        }
+
+        // --- 2) Trader 价钳制 ---
+        try
+        {
+            double traderPrice = traderHelper.GetHighestSellToTraderPrice(tpl);
+            if (traderPrice > result) result = traderPrice;
+        }
+        catch { }
+
+        return result;
+    }
+
+    private bool config_debug() => clampedConfig.debug || unclampedConfig.debug;
+
+    private (DiscountRule Rule, string Name, bool Clamp) ResolveRuleWithName(MongoId itemId)
+    {
+        // 1) 精确 tpl 匹配（unclamped 先插入，所以先被检查）
+        foreach (var (tpl, name, rule, clamp) in parsedTplOverrides)
+        {
+            if (tpl == itemId) return (rule, name, clamp);
         }
 
         // 2) baseClass 匹配
-        foreach (var (baseClass, name, rule) in parsedBaseClassOverrides)
+        foreach (var (baseClass, name, rule, clamp) in parsedBaseClassOverrides)
         {
             try
             {
-                if (itemHelper.IsOfBaseclass(itemId, baseClass))
-                {
-                    return (rule, name);
-                }
+                if (itemHelper.IsOfBaseclass(itemId, baseClass)) return (rule, name, clamp);
             }
-            catch
-            {
-                // 单条匹配失败，继续下一条
-            }
+            catch { }
         }
 
-        return (config.defaultRule, "[default]");
-    }
-
-    private DiscountRule ResolveRule(MongoId itemId)
-    {
-        return ResolveRuleWithName(itemId).Rule;
+        // 默认规则：受钳制
+        return (clampedConfig.defaultRule, "[default]", true);
     }
 
     private void RefreshRagfair()
@@ -632,9 +618,7 @@ public class VariableFleaPricesMod(
         foreach (var offer in ragfairOfferHolder.GetOffers())
         {
             if (offer.IsTraderOffer() || offer.IsPlayerOffer() || expiredIds.Contains(offer.Id))
-            {
                 continue;
-            }
 
             ragfairOfferHolder.FlagOfferAsExpired(offer.Id);
             flagged++;
@@ -653,10 +637,6 @@ public class VariableFleaPricesMod(
         logger.Info($"[VariableFleaPrices] 已刷新 {flagged} 个报价");
     }
 
-    /// <summary>
-    /// 对数插值计算折扣。
-    /// price 在 [minP, maxP] 之间时按 log 曲线在 [minD, maxD] 之间插值。
-    /// </summary>
     private double CalculateDiscount(double price, double minP, double maxP, double minD, double maxD)
     {
         if (maxP <= minP || maxD <= minD) return minD;
