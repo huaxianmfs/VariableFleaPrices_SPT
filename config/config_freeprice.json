@@ -1,0 +1,47 @@
+{
+	"debug": false,
+	"defaultRule": {
+		"minPrice": 0,
+		"maxPrice": 0,
+		"minDiscount": 0.15,
+		"maxDiscount": 0.40
+	},
+	"overrides": [
+		{
+			"name": "交换品_涨价",
+			"itemTpls": [
+				"573476d324597737da2adc13",
+				"56742c284bdc2d98058b456d"
+			],
+			"_itemTplComments": {
+				"573476d324597737da2adc13": "马宝路香烟",
+				"56742c284bdc2d98058b456d": "Crickent打火机"
+			},
+			"rule": {
+				"minPrice": 0,
+				"maxPrice": 0,
+				"minDiscount": -0.45,
+				"maxDiscount": -0.70
+			}
+		},
+		{
+			"name": "交换品_降价",
+			"itemTpls": [
+				"5d0375ff86f774186372f685",
+				"5c0530ee86f774697952d952",
+				"5c052e69886f7746b207bc3c9"
+			],
+			"_itemTplComments": {
+				"5d0375ff86f774186372f685": "军用电缆",
+				"5c0530ee86f774697952d952": "LEDX 小黑",
+				"5c052e69886f7746b207bc3c9": "除颤器 小红"
+			},
+			"rule": {
+				"minPrice": 0,
+				"maxPrice": 0,
+				"minDiscount": 0.90,
+				"maxDiscount": 0.95
+			}
+		}
+	]
+}
